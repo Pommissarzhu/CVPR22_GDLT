@@ -101,10 +101,11 @@ class VST_GDLT(nn.Module):
 
     def forward(self, x):
         x = x.to(self.device)  # 将输入数据移动到指定设备上
-        with torch.no_grad():  # 新增：在测试模式下不计算梯度
+        with torch.no_grad():  # 在测试模式下不计算梯度
             x = self.vst_backbone(x)  # 使用预训练骨干网络提取特征
-            x = self.pool(x).squeeze(3).squeeze(3)  # 调整维度以匹配输入要求
-        
+            x = self.pool(x).squeeze(3).squeeze(3)  # 池化并去除空间维度（H, W）
+            x = x.transpose(1, 2)  # 调整维度顺序为 (B, T, C) 以匹配 in_proj 输入要求
+        # print("输入到in_proj前的形状:", x.shape)
         # x (b, t, c)
         b, t, c = x.shape
         x = self.in_proj(x.transpose(1, 2)).transpose(1, 2)
