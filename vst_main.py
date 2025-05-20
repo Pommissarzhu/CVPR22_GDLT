@@ -9,17 +9,22 @@ from models import model, loss
 import os
 from torch import nn
 from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+import cv2
+from PIL import Image
 
 import train
 from test import test_epoch
+
 
 class VideoDataset(Dataset):
     """
     自定义视频数据集（支持 TES/PCS Min-Max归一化）
     """
     def __init__(self, list_file, transform=None, clip_len=32, 
-                 tes_min=0.0, tes_max=1.0,  # 新增：训练集 TES 最小/最大值
-                 pcs_min=0.0, pcs_max=1.0): # 新增：训练集 PCS 最小/最大值
+                 tes_min=0.0, tes_max=1.0,  # 训练集 TES 最小/最大值
+                 pcs_min=0.0, pcs_max=1.0,  # 训练集 PCS 最小/最大值
+                 score_type="both"):        # 新增参数：指定返回分数类型（"TES"/"PCS"/"both"）
         self.clip_len = clip_len
         self.transform = transform
         self.samples = []
@@ -28,6 +33,7 @@ class VideoDataset(Dataset):
         self.tes_max = tes_max
         self.pcs_min = pcs_min
         self.pcs_max = pcs_max
+        self.score_type = score_type  # 保存分数类型参数
         with open(list_file, 'r') as f:
             for line in f:
                 parts = line.strip().split()
@@ -72,7 +78,15 @@ class VideoDataset(Dataset):
         # Min-Max归一化（防止除零，分母加1e-8）
         normalized_tes = (tes - self.tes_min) / (self.tes_max - self.tes_min + 1e-8)
         normalized_pcs = (pcs - self.pcs_min) / (self.pcs_max - self.pcs_min + 1e-8)
-        target = torch.tensor([normalized_tes, normalized_pcs], dtype=torch.float32)
+        
+        # 根据score_type选择目标分数（关键修改：移除列表包裹，生成一维标签）
+        if self.score_type == "TES":
+            target = torch.tensor(normalized_tes, dtype=torch.float32)  # 改为标量创建，批量后为[batch_size]
+        elif self.score_type == "PCS":
+            target = torch.tensor(normalized_pcs, dtype=torch.float32)  # 改为标量创建，批量后为[batch_size]
+        else:  # 默认返回两者（兼容原逻辑，形状为[batch_size, 2]）
+            target = torch.tensor([normalized_tes, normalized_pcs], dtype=torch.float32)
+        
         return vid, target
 
 def setup_seed(seed):
@@ -110,24 +124,32 @@ def get_scheduler(optim, args):
         scheduler = None
     return scheduler
 
-# ---------- 硬编码模型配置和权重路径 ----------
-root = '/root/autodl-tmp/Video-Swin-Transformer-master'  # 模型仓库根目录
-config_file = os.path.join(
-    root,
-    'configs/recognition/swin/swin_base_patch244_window877_kinetics600_22k.py'
-)
-checkpoint_file = os.path.join(
-    root,
-    'swin_base_patch244_window877_kinetics600_22k.pth'
-)
-# -----------------------------------------------
-
 if __name__ == '__main__':
+
+    # ---------- 硬编码模型配置和权重路径 ----------
+    root = '/root/autodl-tmp/Video-Swin-Transformer-master'  # 模型仓库根目录
+    config_file = os.path.join(
+        root,
+        'configs/recognition/swin/swin_base_patch244_window877_kinetics600_22k.py'
+    )
+    checkpoint_file = os.path.join(
+        root,
+        'swin_base_patch244_window877_kinetics600_22k.pth'
+    )
+    # -----------------------------------------------
+
+    # ---------- 硬编码数据集和视频路径 ----------
+    dataset_root = '/root/autodl-tmp/dataset'  # 存放 train_dataset.txt, test_dataset.txt
+    video_dir = '/root/autodl-tmp/videos'     # 存放所有视频文件 (.mp4, .mov)
+    # -----------------------------------------------
+    clip_len=32
+    batch_size=2
+
     args = options.parser.parse_args()
     setup_seed(0)
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    dataset_root = "dataetroot"
+    dataset_root = "/root/autodl-tmp/dataset"
 
     '''
     1. load data
@@ -142,33 +164,35 @@ if __name__ == '__main__':
     test_list  = os.path.join(dataset_root, 'test_dataset.txt')
 
     # 初始加载训练集以计算Min-Max统计量
-    temp_train_ds = VideoDataset(train_list, transform=transform, clip_len=args.clip_len)
+    temp_train_ds = VideoDataset(train_list, transform=transform, clip_len=clip_len)
     train_tes = [sample[1] for sample in temp_train_ds.samples]  # 原始 TES 分数
     train_pcs = [sample[2] for sample in temp_train_ds.samples]  # 原始 PCS 分数
     tes_min, tes_max = np.min(train_tes), np.max(train_tes)
     pcs_min, pcs_max = np.min(train_pcs), np.max(train_pcs)
 
-    # 重新初始化数据集（传入Min-Max参数）
+    # 重新初始化数据集（传入Min-Max参数和score_type）
     train_ds = VideoDataset(
         train_list, 
         transform=transform, 
-        clip_len=args.clip_len,
+        clip_len=clip_len,
         tes_min=tes_min, 
         tes_max=tes_max,
         pcs_min=pcs_min, 
-        pcs_max=pcs_max
+        pcs_max=pcs_max,
+        score_type="TES"  # 新增参数
     )
     test_ds = VideoDataset(
         test_list, 
         transform=transform, 
-        clip_len=args.clip_len,
+        clip_len=clip_len,
         tes_min=tes_min,  # 测试集使用训练集的Min-Max
         tes_max=tes_max,
         pcs_min=pcs_min,
-        pcs_max=pcs_max
+        pcs_max=pcs_max,
+        score_type="TES"  # 新增参数
     )
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=4)
     print('=============Load dataset successfully=============')
 
     '''
